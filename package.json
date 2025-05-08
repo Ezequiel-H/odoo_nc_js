@@ -1,0 +1,14 @@
+{
+  "name": "eliminar-productos-bo",
+  "version": "1.0.0",
+  "description": "Script to process Odoo claims using Puppeteer",
+  "main": "main.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "csv-parse": "^5.5.0",
+    "googleapis": "^148.0.0",
+    "puppeteer": "^21.0.0"
+  }
+}
