@@ -30,111 +30,16 @@ const MOTIVOS_REEMBOLSADO = {
     'Support - DTC - Operations - Order nor Delivered': 'Productos faltantes',
 };
 
-function parseSlackIframeHtml(htmlString) {
-    // Detect order number
-    const orderMatch = htmlString.match(/El pedido (\d+)/);
-    const orderNumber = orderMatch ? orderMatch[1] : null;
-
-    // Detect status: reembolso o anulación
-    let status, motive;
-    if (htmlString.includes("fue anulado")) {
-        status = "anulado";
-        const motiveMatch = htmlString.match(/con motivo ([\w_]+)/);
-        motive = motiveMatch ? motiveMatch[1] : null;
-    } else if (htmlString.includes("fue reembolsado")) {
-        status = "reembolsado";
-        motive = null;
-    } else {
-        status = "desconocido";
-        motive = null;
-    }
-
-    // Extract Odoo link
-    let odooLink = null;
-    const lines = htmlString.split('\n');
-    for (const line of lines) {
-        if (line.includes("https://nilus-ar.odoo.com")) {
-            odooLink = line.trim();
-            break;
-        }
-    }
-
-    // Extract products
-    const products = [];
-    if (status === "reembolsado") {
-        const productsLines = [];
-        let insideBlock = false;
-
-        for (const line of lines) {
-            if (line.includes("fue reembolsado")) {
-                insideBlock = true;
-                continue;
-            }
-            if (line.includes("Backoffice:")) {
-                insideBlock = false;
-            }
-            if (insideBlock) {
-                productsLines.push(line.trim());
-            }
-        }
-
-        // Clean lines
-        const cleanLines = productsLines.filter(line => line && !line.startsWith("https"));
-
-        let currentProduct = {};
-        for (const line of cleanLines) {
-            if (!line || line.startsWith("https")) continue;
-
-            if (line.match(/^Support - DTC/)) {
-                currentProduct.support_info = line;
-            } else if (line.startsWith("x")) {
-                const quantityMatch = line.match(/x(\d+)/);
-                currentProduct.quantity = quantityMatch ? quantityMatch[1] : "0";
-            } else if (line.startsWith("$")) {
-                const priceMatch = line.match(/\$(\d+\.?\d*)/);
-                currentProduct.price = priceMatch ? priceMatch[1] : "0";
-                products.push(currentProduct);
-                currentProduct = {};
-            } else if (line.match(/^\d{1,4}$/)) {
-                if (line.length > 3) {
-                    currentProduct.product_id = parseInt(line).toLocaleString('en-US').replace(/,/g, '.');
-                } else {
-                    currentProduct.product_id = line;
-                }
-            } else {
-                currentProduct.product_name = line;
-            }
-        }
-
-        if (Object.keys(currentProduct).length > 0) {
-            products.push(currentProduct);
-        }
-    }
-
-    return {
-        order_number: orderNumber,
-        status,
-        motive,
-        products,
-        odoo_link: odooLink
-    };
+function logMessage(message, logs) {
+    console.log(message);
+    logs.push(message);
 }
 
-async function processCsvFile(csvFilePath) {
-    return new Promise((resolve, reject) => {
-        const results = [];
-        fs.createReadStream(csvFilePath)
-            .pipe(csv.parse())
-            .on('data', (row) => {
-                if (row.length > 0) {
-                    const htmlContent = row[0];
-                    const parsedData = parseSlackIframeHtml(htmlContent);
-                    results.push(parsedData);
-                }
-            })
-            .on('end', () => resolve(results))
-            .on('error', (error) => reject(error));
-    });
+function processCycleEnd(linea, logs, failed, succeeded) {
+    linea.status = failed ? "ERROR" : (succeeded ? "OK" : "Compartidas");
+    linea.output = logs.join("\n");
+    console.log("linea", linea);
+    return wait(5);
 }
 
 async function clickButton(page, selector, waitTime = 10000) {
@@ -177,25 +82,6 @@ function imprimirReclamo(reclamo) {
 
 const wait = async (s) => new Promise(resolve => setTimeout(resolve, s*1000));
 
-async function findAndProcessCsvFile() {
-    // Find CSV file
-    const folderPath = path.join(__dirname);
-    const csvFiles = fs.readdirSync(folderPath).filter(file => file.endsWith('.csv'));
-
-    if (csvFiles.length === 0) {
-        console.log("❌ No se encontraron archivos CSV en el directorio");
-        return null;
-    }
-
-    const csvFile = path.join(folderPath, csvFiles[0]);
-    const fileContent = fs.readFileSync(csvFile, 'utf-8');
-    return fileContent;
-    // console.log(`📄 Procesando archivo: ${csvFiles[0]}`);
-    // const reclamos = await processCsvFile(csvFile);
-    // console.log(`📊 Total de reclamos a procesar: ${reclamos.length}`);
-    // return reclamos;
-}
-
 async function main() {
     let HEADLESS = false;
     HEADLESS = "new"; 
@@ -216,8 +102,12 @@ async function main() {
     }
 
     // Get reclamos from CSV
-    const reclamos = await findAndProcessCsvFile();
-    if (!reclamos) {
+    const posiblesLineas = await readSheet();
+    const lineas = posiblesLineas.filter(linea => 
+        linea.status === "Compartidas" && 
+        linea.output === ""
+    );
+    if (!lineas) {
         await browser.close();
         return;
     }
@@ -236,9 +126,14 @@ async function main() {
     await page.reload();
 
     // Process each reclamo
-    for (const reclamo of reclamos) {
+    for (const linea of lineas) {
+        const {reclamo, rowId} = linea;
+        const logs = []
+        let failed = false
+        let succeeded = false
         try {
             imprimirReclamo(reclamo);
+            logMessage(`Procesando reclamo ${reclamo.order_number}`, logs);
             await page.goto(reclamo.odoo_link);
             await page.reload();
             await wait(10)
@@ -249,15 +144,21 @@ async function main() {
                 const children = await actionManager.$$('*');
                 if (children.length === 0) {
                     stats.failed_reclamos++;
+                    logMessage("🚨 Link invalido. No hay contenido en link de Odoo", logs);
+                    failed = true;
+                    await processCycleEnd(linea, logs, failed, succeeded);
                     throw new Error("🚨 Link invalido. No hay contenido en link de Odoo");
                 }
             } catch (error) {
                 stats.failed_reclamos++;
+                logMessage("🚨 Link invalido. No hay contenido en link de Odoo", logs);
+                failed = true;
+                await processCycleEnd(linea, logs, failed, succeeded);
                 throw new Error("🚨 Link invalido. No hay contenido en link de Odoo");
             }
 
             try {
-                console.log("Esperando a que se muestre el botón de facturas");
+                logMessage("Esperando a que se muestre el botón de facturas", logs);
                 const buttonInvoices = await page.waitForSelector('[name="action_view_invoice"]', { visible: true });
                 const valueElement = await buttonInvoices.$('span.o_stat_value');
                 const valueText = await page.evaluate(el => el.textContent.trim(), valueElement);
@@ -266,8 +167,9 @@ async function main() {
                     await clickButton(page, '[name="action_view_invoice"]');
                     await clickButton(page, '[name="action_reverse"]');
                 } else {
-                    console.log(`♴ Multiples facturas o ya hay NC. Saltando reclamo: ${reclamo.order_number}`);
+                    logMessage(`♴ Multiples facturas o ya hay NC. Saltando reclamo: ${reclamo.order_number}`, logs);
                     stats.multiple_invoices++;
+                    await processCycleEnd(linea, logs, failed, succeeded);
                     continue;
                 }
             } catch (error) {
@@ -279,22 +181,24 @@ async function main() {
                 const modal = await page.waitForSelector('div.modal-content', { visible: true, timeout: 5000 }).catch(() => null);
 
                 if (modal) {
-                    console.log("✅ Modal encontrado, haciendo clic en Confirmar");
+                    logMessage("✅ Modal encontrado, haciendo clic en Confirmar", logs);
                     try {
                         // Wait for the Confirmar button inside the modal to be visible
                         const confirmButton = await page.waitForSelector('div.modal-content button[name="action_cancel"]', { visible: true });
                         // Click the Confirmar button
                         await confirmButton.click();
                     } catch (modalError) {
-                        console.log("ℹ️ No se pudo interactuar con el modal, continuando...");
+                        logMessage("ℹ️ No se pudo interactuar con el modal, continuando...", logs);
                     }
                 } else {
-                    console.log("ℹ️ No hay modal porque el pedido ya habia sido confirmado");
+                    logMessage("ℹ️ No hay modal porque el pedido ya habia sido confirmado", logs);
                 }
 
-                console.log("✅ No hay factura, cancelando reclamo");
+                logMessage("✅ No hay factura, cancelando reclamo", logs);
                 stats.successful_reclamos++;
-                await wait(20);
+                succeeded = true;
+                await wait(10)
+                await processCycleEnd(linea, logs, failed, succeeded);
                 continue;
             }
 
@@ -355,12 +259,15 @@ async function main() {
                 await wait(2);
             
                 if (reclamo.status === 'anulado') {
-                    console.log("✅ Anulado con éxito");
+                    logMessage("✅ Anulado con éxito", logs);
                     stats.successful_reclamos++;
+                    succeeded = true;
                 }
             } catch (error) {
-                console.log(`⚠️ Error al interactuar con el modal: ${error}`);
+                logMessage(`⚠️ Error al interactuar con el modal: ${error}`, logs);
                 stats.failed_reclamos++;
+                failed = true;
+                await processCycleEnd(linea, logs, failed, succeeded);
                 continue;
             }
             
@@ -375,8 +282,10 @@ async function main() {
                     await clickButton(page, 'input[name="x_studio_id_producto"]');
                     await clickButton(page, 'i.o_optional_columns_dropdown_toggle.fa.fa-ellipsis-v');
                 } catch (error) {
-                    console.log(`⚠️ No se pudo hacer clic en el botón de opciones: ${error}`);
+                    logMessage(`⚠️ No se pudo hacer clic en el botón de opciones: ${error}`, logs);
                     stats.failed_reclamos++;
+                    failed = true;
+                    await processCycleEnd(linea, logs, failed, succeeded);
                     continue;
                 }
 
@@ -411,7 +320,7 @@ async function main() {
 
                             if (nombreProductoNuevaTabla === nombreProducto) {
                                 if (nombreProducto in productosReclamo) {
-                                    console.log(`Producto ${nombreProducto} en reclamo`);
+                                    logMessage(`Producto ${nombreProducto} en reclamo`, logs);
                                     const cantidadReclamo = productosReclamo[nombreProducto];
 
                                     await page.evaluate((row) => {
@@ -427,9 +336,12 @@ async function main() {
                                         await wait(8)
                                         await page.waitForSelector('button.o_form_button_edit', { visible: true });
                                         await clickButton(page, 'button.o_form_button_edit');
+                                        succeeded = true;
                                     } catch (error) {
-                                        console.log(`⚠️ No se pudo guardar ${nombreProducto}: ${error}`);
+                                        logMessage(`⚠️ No se pudo guardar ${nombreProducto}: ${error}`, logs);
                                         stats.failed_reclamos++;
+                                        failed = true;
+                                        await processCycleEnd(linea, logs, failed, succeeded);
                                         continue;
                                     }
                                 } else {
@@ -440,9 +352,12 @@ async function main() {
                                             if (button) button.click();
                                         }, row);
                                         await wait(2)
+                                        succeeded = true;
                                     } catch (error) {
-                                        console.log(`⚠️ No se pudo borrar ${nombreProducto}: ${error}`);
+                                        logMessage(`⚠️ No se pudo borrar ${nombreProducto}: ${error}`, logs);
                                         stats.failed_reclamos++;
+                                        failed = true;
+                                        await processCycleEnd(linea, logs, failed, succeeded);
                                         continue;
                                     }
                                 }
@@ -450,8 +365,10 @@ async function main() {
                             }
                         }
                     } catch (error) {
-                        console.log(`⚠️ Error general con el producto ${nombreProducto}: ${error}`);
+                        logMessage(`⚠️ Error general con el producto ${nombreProducto}: ${error}`, logs);
                         stats.failed_reclamos++;
+                        failed = true;
+                        await processCycleEnd(linea, logs, failed, succeeded);
                         continue;
                     }
                 }
@@ -468,7 +385,7 @@ async function main() {
                 const invoiceElement = await page.$('ol.breadcrumb li.breadcrumb-item.o_back_button a');
                 const invoiceId = await page.evaluate(el => el.textContent.trim(), invoiceElement);
 
-                console.log("Esperando a que se actualice la tabla");
+                logMessage("Esperando a que se actualice la tabla", logs);
                 await wait(10)
                 await page.waitForSelector('table tbody tr');
                 const finalRows = await page.$$('table tbody tr');
@@ -478,7 +395,7 @@ async function main() {
                     if (columns.length === 3) {
                         const invoiceNumber = await page.evaluate(el => el.textContent.trim(), columns[1]);
                         if (invoiceNumber === invoiceId) {
-                            console.log(`Found matching invoice: ${invoiceNumber}`);
+                            logMessage(`Found matching invoice: ${invoiceNumber}`, logs);
                             try {
                                 // Find the <a> tag in the row whose innerText is "Añadir"
                                 const links = await row.$$('a');
@@ -494,13 +411,17 @@ async function main() {
                                 if (addButton) {
                                     await addButton.click();
                                     stats.successful_reclamos++;
-                                    console.log("✅ Reembolso parcial exitoso");
+                                    logMessage("✅ Reembolso parcial exitoso", logs);
+                                    succeeded = true;
                                 } else {
+                                    logMessage("Error: Link with text 'Añadir' not found.", logs);
                                     throw new Error("Link with text 'Añadir' not found.");
                                 }
                             } catch (error) {
-                                console.error("⚠️ Error: 'Añadir' button not found in row:", error);
+                                logMessage(`⚠️ Error: 'Añadir' button not found in row: ${error}`, logs);
                                 stats.failed_reclamos++;
+                                failed = true;
+                                await processCycleEnd(linea, logs, failed, succeeded);
                             }
                             break;
                         }
@@ -509,12 +430,13 @@ async function main() {
 
             }
         } catch (error) {
-            console.log(`⚠️ Error general procesando reclamo: ${error}`);
+            logMessage(`⚠️ Error general procesando reclamo: ${error}`, logs);
             stats.failed_reclamos++;
+            failed = true;
+            await processCycleEnd(linea, logs, failed, succeeded);
             continue;
         }
-
-        await wait(10)
+        await processCycleEnd(linea, logs, failed, succeeded);
     }
 
     console.log("\n" + "=".repeat(50));
@@ -530,10 +452,4 @@ async function main() {
     await browser.close();
 }
 
-(async () => {
-    const csvReclamos = await findAndProcessCsvFile();
-    console.log("csvReclamos", csvReclamos);
-    await readSheet();
-})();
-
-// main().catch(console.error); 
+main().catch(console.error); 
