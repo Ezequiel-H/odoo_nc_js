@@ -3,6 +3,7 @@ const fs = require('fs');
 const csv = require('csv-parse');
 const path = require('path');
 const { readSheet } = require('./sheets');
+const { loginToOdoo, wait, clickButton, navigateToReclamo } = require('./functions');
 
 // Initialize counters and error tracking
 const stats = {
@@ -88,8 +89,8 @@ function parseSlackIframeHtml(htmlString) {
             if (line.match(/^Support - DTC/)) {
                 currentProduct.support_info = line;
             } else if (line.startsWith("x")) {
-                const quantityMatch = line.match(/x(\d+)/);
-                currentProduct.quantity = quantityMatch ? quantityMatch[1] : "0";
+                const quantityMatch = line.match(/x(\d+(?:\.\d+)?)/);
+                currentProduct.quantity = quantityMatch ? quantityMatch[1].replace('.', ',') : "0";
             } else if (line.startsWith("$")) {
                 const priceMatch = line.match(/\$(\d+\.?\d*)/);
                 currentProduct.price = priceMatch ? priceMatch[1] : "0";
@@ -137,17 +138,6 @@ async function processCsvFile(csvFilePath) {
     });
 }
 
-async function clickButton(page, selector, waitTime = 10000) {
-    try {
-        await page.waitForSelector(selector, { timeout: waitTime });
-        await page.click(selector);
-        return true;
-    } catch (error) {
-        console.log(`🛎️ Error clicking button with selector ${selector}: ${error}`);
-        return false;
-    }
-}
-
 function imprimirReclamo(reclamo) {
     stats.total_reclamos++;
     const order = reclamo.order_number || 'N/A';
@@ -175,8 +165,6 @@ function imprimirReclamo(reclamo) {
     console.log(`🔗 Ver en Odoo: ${link}`);
 }
 
-const wait = async (s) => new Promise(resolve => setTimeout(resolve, s*1000));
-
 async function findAndProcessCsvFile() {
     // Find CSV file
     const folderPath = path.join(__dirname);
@@ -188,12 +176,9 @@ async function findAndProcessCsvFile() {
     }
 
     const csvFile = path.join(folderPath, csvFiles[0]);
-    const fileContent = fs.readFileSync(csvFile, 'utf-8');
-    return fileContent;
-    // console.log(`📄 Procesando archivo: ${csvFiles[0]}`);
-    // const reclamos = await processCsvFile(csvFile);
-    // console.log(`📊 Total de reclamos a procesar: ${reclamos.length}`);
-    // return reclamos;
+    const reclamos = await processCsvFile(csvFile);
+    console.log(`📊 Total de reclamos a procesar: ${reclamos.length}`);
+    return reclamos;
 }
 
 async function main() {
@@ -223,25 +208,14 @@ async function main() {
     }
 
     // Login to Odoo
-    await page.goto('https://nilus-ar.odoo.com/web/login');
+    await loginToOdoo(page);
 
-    await wait(4)
-
-    await page.waitForSelector('input[name="login"]');
-    await page.type('input[name="login"]', 'nilus-tech@nilus.co');
-    await page.type('input[name="password"]', 'nilus-tech');
-    await clickButton(page, 'button[type="submit"]');
-    await wait(1)
-
-    await page.reload();
+    let columnsSelected = false;
 
     // Process each reclamo
     for (const reclamo of reclamos) {
         try {
-            imprimirReclamo(reclamo);
-            await page.goto(reclamo.odoo_link);
-            await page.reload();
-            await wait(10)
+            await navigateToReclamo(page, reclamo);
 
             // Check if the page has content
             try {
@@ -303,9 +277,12 @@ async function main() {
                 await page.waitForSelector('.modal-dialog');
 
                 // Click radio button inside modal
-                await page.evaluate((status) => {
+                const modalResult = await page.evaluate((status) => {
                     const modal = document.querySelector('.modal-dialog');
-                    if (!modal) return;
+                    if (!modal) {
+                        console.log("❌ No se encontró el modal");
+                        return { success: false, error: "Modal no encontrado" };
+                    }
                 
                     const valueMap = {
                         anulado: 'cancel',        // Reembolso completo
@@ -313,11 +290,26 @@ async function main() {
                     };
                 
                     const value = valueMap[status];
-                    if (!value) return;
+                    if (!value) {
+                        console.log(`❌ Estado no válido: ${status}`);
+                        return { success: false, error: "Estado no válido" };
+                    }
                 
                     const radio = modal.querySelector(`input[type="radio"][data-value="${value}"]`);
-                    if (radio) radio.click();
+                    if (!radio) {
+                        console.log(`❌ No se encontró el radio button para ${value}`);
+                        return { success: false, error: "Radio button no encontrado" };
+                    }
+                    
+                    radio.click();
+                    return { success: true };
                 }, reclamo.status);
+
+                if (!modalResult.success) {
+                    console.log(`⚠️ Error en el modal: ${modalResult.error}`);
+                    stats.failed_reclamos++;
+                    continue;
+                }
                 
                 // Determine input text
                 const inputText =
@@ -327,30 +319,66 @@ async function main() {
                             ? MOTIVOS_REEMBOLSADO[reclamo.products[0].support_info] || MOTIVOS_REEMBOLSADO['Support - DTC - Contact - Missing Product']
                             : 'Sin motivo';
             
+                console.log(`📝 Intentando escribir motivo: ${inputText}`);
                 // Type into the autocomplete input
                 await page.type('input.ui-autocomplete-input', inputText);
             
                 // Wait for dropdown options and select matching one
-                await page.waitForSelector('a.dropdown-item.ui-menu-item-wrapper');
-                const options = await page.$$('a.dropdown-item.ui-menu-item-wrapper');
-                for (const option of options) {
-                    const text = await page.evaluate(el => el.textContent.trim(), option);
-                    if (text === inputText) {
-                        await option.click();
-                        break;
+                try {
+                    await page.waitForSelector('a.dropdown-item.ui-menu-item-wrapper', { timeout: 5000 });
+                    const options = await page.$$('a.dropdown-item.ui-menu-item-wrapper');
+                    let optionFound = false;
+                    
+                    for (const option of options) {
+                        const text = await page.evaluate(el => el.textContent.trim(), option);
+                        if (text === inputText) {
+                            await option.click();
+                            optionFound = true;
+                            break;
+                        }
                     }
+                    
+                    if (!optionFound) {
+                        console.log(`⚠️ No se encontró la opción exacta para: ${inputText}`);
+                        // Click the first option as fallback
+                        if (options.length > 0) {
+                            await options[0].click();
+                            console.log("✅ Se seleccionó la primera opción disponible");
+                        } else {
+                            throw new Error("No hay opciones disponibles en el dropdown");
+                        }
+                    }
+                } catch (error) {
+                    console.log(`⚠️ Error al seleccionar opción del dropdown: ${error}`);
+                    stats.failed_reclamos++;
+                    continue;
                 }
             
                 await wait(4);
             
                 // Click the reverse button inside the modal
-                await page.evaluate(() => {
+                const reverseResult = await page.evaluate(() => {
                     const modal = document.querySelector('.modal-dialog');
-                    if (!modal) return;
+                    if (!modal) {
+                        console.log("❌ Modal desapareció antes de hacer clic en reverse");
+                        return { success: false, error: "Modal no encontrado" };
+                    }
             
                     const button = modal.querySelector('button[name="reverse_moves"]');
-                    if (button) button.click();
+                    if (!button) {
+                        console.log("❌ No se encontró el botón reverse_moves");
+                        return { success: false, error: "Botón no encontrado" };
+                    }
+                    
+                    button.click();
+                    return { success: true };
                 });
+
+                if (!reverseResult.success) {
+                    console.log(`⚠️ Error al hacer clic en reverse: ${reverseResult.error}`);
+                    stats.failed_reclamos++;
+                    continue;
+                }
             
                 await wait(2);
             
@@ -364,16 +392,18 @@ async function main() {
                 continue;
             }
             
-
             if (reclamo.status === 'reembolsado' && reclamo.products.length > 0) {
                 await wait(3)
                 await clickButton(page, 'button.o_form_button_edit');
                 await wait(5)
 
                 try {
-                    await clickButton(page, 'i.o_optional_columns_dropdown_toggle.fa.fa-ellipsis-v');
-                    await clickButton(page, 'input[name="x_studio_id_producto"]');
-                    await clickButton(page, 'i.o_optional_columns_dropdown_toggle.fa.fa-ellipsis-v');
+                    if (!columnsSelected) {
+                        await clickButton(page, 'i.o_optional_columns_dropdown_toggle.fa.fa-ellipsis-v');
+                        await clickButton(page, 'input[name="x_studio_id_producto"]');
+                        await clickButton(page, 'i.o_optional_columns_dropdown_toggle.fa.fa-ellipsis-v');
+                        columnsSelected = true;
+                    }
                 } catch (error) {
                     console.log(`⚠️ No se pudo hacer clic en el botón de opciones: ${error}`);
                     stats.failed_reclamos++;
@@ -384,35 +414,40 @@ async function main() {
 
                 const productosReclamo = {};
                 for (const p of reclamo.products) {
-                    productosReclamo[p.product_id] = parseInt(p.quantity);
+                    productosReclamo[p.product_id] = p.quantity;
                 }
+                console.log("Productos a reembolsar:", productosReclamo);
 
                 // Get initial snapshot of rows
                 const filasSnapshot = await page.evaluate(() => {
                     const rows = Array.from(document.querySelectorAll('tbody.ui-sortable tr.o_data_row'));
                     return rows.map(row => {
                         const cells = row.querySelectorAll('td');
-                        return cells[2].textContent.trim();
+                        const productId = cells[2].textContent.trim();
+                        if (productId === "116") {
+                            console.log("Bonificacion encontrada");
+                        }
+                        return productId;
                     });
                 });
+                console.log("Productos encontrados en la tabla:", filasSnapshot);
 
                 // Process each row
-                for (const nombreProducto of filasSnapshot) {
+                for (const productId of filasSnapshot) {
                     try {
                         await wait(2)
                         const rows = await page.$$('tbody.ui-sortable tr.o_data_row');
 
                         for (const row of rows) {
-                            const nombreProductoNuevaTabla = await page.evaluate(el => {
+                            const currentProductId = await page.evaluate(el => {
                                 const cells = el.querySelectorAll('td');
-                                return cells[2].textContent.trim();
+                                const text = cells[2].textContent.trim();
+                                return text;
                             }, row);
-
-
-                            if (nombreProductoNuevaTabla === nombreProducto) {
-                                if (nombreProducto in productosReclamo) {
-                                    console.log(`Producto ${nombreProducto} en reclamo`);
-                                    const cantidadReclamo = productosReclamo[nombreProducto];
+                            if (currentProductId === productId) {
+                                if (productId in productosReclamo) {
+                                    console.log(`Producto ${productId} en reclamo con cantidad ${productosReclamo[productId]}`);
+                                    const cantidadReclamo = productosReclamo[productId];
 
                                     await page.evaluate((row) => {
                                         const cell = row.querySelector('td[name="quantity"]');
@@ -424,11 +459,11 @@ async function main() {
 
                                     try {
                                         await clickButton(page, '.o_form_button_save');
-                                        await wait(8)
+                                        await wait(12)
                                         await page.waitForSelector('button.o_form_button_edit', { visible: true });
                                         await clickButton(page, 'button.o_form_button_edit');
                                     } catch (error) {
-                                        console.log(`⚠️ No se pudo guardar ${nombreProducto}: ${error}`);
+                                        console.log(`⚠️ No se pudo guardar ${productId}: ${error}`);
                                         stats.failed_reclamos++;
                                         continue;
                                     }
@@ -441,7 +476,7 @@ async function main() {
                                         }, row);
                                         await wait(2)
                                     } catch (error) {
-                                        console.log(`⚠️ No se pudo borrar ${nombreProducto}: ${error}`);
+                                        console.log(`⚠️ No se pudo borrar ${productId}: ${error}`);
                                         stats.failed_reclamos++;
                                         continue;
                                     }
@@ -450,7 +485,7 @@ async function main() {
                             }
                         }
                     } catch (error) {
-                        console.log(`⚠️ Error general con el producto ${nombreProducto}: ${error}`);
+                        console.log(`⚠️ Error general con el producto ${productId}: ${error}`);
                         stats.failed_reclamos++;
                         continue;
                     }
@@ -508,6 +543,7 @@ async function main() {
                 }
 
             }
+
         } catch (error) {
             console.log(`⚠️ Error general procesando reclamo: ${error}`);
             stats.failed_reclamos++;
@@ -530,10 +566,4 @@ async function main() {
     await browser.close();
 }
 
-(async () => {
-    const csvReclamos = await findAndProcessCsvFile();
-    console.log("csvReclamos", csvReclamos);
-    await readSheet();
-})();
-
-// main().catch(console.error); 
+main().catch(console.error); 
