@@ -2,7 +2,7 @@ const puppeteer = require('puppeteer');
 const fs = require('fs');
 const csv = require('csv-parse');
 const path = require('path');
-const { readSheet } = require('./sheets');
+const { readSheet, writeToSheet } = require('./sheets');
 const { loginToOdoo, wait, clickButton, navigateToReclamo } = require('./functions');
 
 // Initialize counters and error tracking
@@ -12,6 +12,12 @@ const stats = {
     failed_reclamos: 0,
     multiple_invoices: 0
 };
+
+function addLog(logs, message) {
+    logs.push(message);
+    console.log(message);
+    return logs;
+}
 
 const MOTIVOS_ANULADO = {
     'dropoff_closed_point': 'Baja del punto de entrega',
@@ -181,6 +187,16 @@ async function findAndProcessCsvFile() {
     return reclamos;
 }
 
+const resultados = [];
+const guardarResultados = ({rowId, status, output}) => {
+    const index = resultados.findIndex(r => r.rowId === rowId);
+    if (index !== -1) {
+        resultados[index] = {rowId, status, output};
+    } else {
+        resultados.push({rowId, status, output}); 
+    }
+}
+
 async function main() {
     let HEADLESS = false;
     HEADLESS = "new"; 
@@ -201,11 +217,20 @@ async function main() {
     }
 
     // Get reclamos from CSV
-    const reclamos = await findAndProcessCsvFile();
-    if (!reclamos) {
+    const lineasDesordenadas = await readSheet();
+    if (!lineasDesordenadas) {
         await browser.close();
         return;
     }
+
+    lineas = lineasDesordenadas.sort((a, b) => {
+        const statusA = a.reclamo.status.toLowerCase();
+        const statusB = b.reclamo.status.toLowerCase();
+      
+        return statusA.localeCompare(statusB);
+    });
+
+    stats.total_reclamos = lineas.length
 
     // Login to Odoo
     await loginToOdoo(page);
@@ -213,7 +238,9 @@ async function main() {
     let columnsSelected = false;
 
     // Process each reclamo
-    for (const reclamo of reclamos) {
+    for (const linea of lineas) {
+        const logs = []
+        const { reclamo, rowId } = linea;
         try {
             await navigateToReclamo(page, reclamo);
 
@@ -223,15 +250,25 @@ async function main() {
                 const children = await actionManager.$$('*');
                 if (children.length === 0) {
                     stats.failed_reclamos++;
+                    guardarResultados({
+                        rowId,
+                        status: "ERROR",
+                        output: logs
+                    });
                     throw new Error("🚨 Link invalido. No hay contenido en link de Odoo");
                 }
             } catch (error) {
                 stats.failed_reclamos++;
+                guardarResultados({
+                    rowId,
+                    status: "ERROR",
+                    output: logs
+                });
                 throw new Error("🚨 Link invalido. No hay contenido en link de Odoo");
             }
 
             try {
-                console.log("Esperando a que se muestre el botón de facturas");
+                addLog(logs, "Esperando a que se muestre el botón de facturas");
                 const buttonInvoices = await page.waitForSelector('[name="action_view_invoice"]', { visible: true });
                 const valueElement = await buttonInvoices.$('span.o_stat_value');
                 const valueText = await page.evaluate(el => el.textContent.trim(), valueElement);
@@ -240,8 +277,13 @@ async function main() {
                     await clickButton(page, '[name="action_view_invoice"]');
                     await clickButton(page, '[name="action_reverse"]');
                 } else {
-                    console.log(`♴ Multiples facturas o ya hay NC. Saltando reclamo: ${reclamo.order_number}`);
+                    addLog(logs, `♴ Multiples facturas o ya hay NC. Saltando reclamo: ${reclamo.order_number}`);
                     stats.multiple_invoices++;
+                    guardarResultados({
+                        rowId,
+                        status: "ERROR",
+                        output: logs
+                    });
                     continue;
                 }
             } catch (error) {
@@ -253,22 +295,27 @@ async function main() {
                 const modal = await page.waitForSelector('div.modal-content', { visible: true, timeout: 5000 }).catch(() => null);
 
                 if (modal) {
-                    console.log("✅ Modal encontrado, haciendo clic en Confirmar");
+                    addLog(logs, "✅ Modal encontrado, haciendo clic en Confirmar");
                     try {
                         // Wait for the Confirmar button inside the modal to be visible
                         const confirmButton = await page.waitForSelector('div.modal-content button[name="action_cancel"]', { visible: true });
                         // Click the Confirmar button
                         await confirmButton.click();
                     } catch (modalError) {
-                        console.log("ℹ️ No se pudo interactuar con el modal, continuando...");
+                        addLog(logs, "ℹ️ No se pudo interactuar con el modal, continuando...");
                     }
                 } else {
-                    console.log("ℹ️ No hay modal porque el pedido ya habia sido confirmado");
+                    addLog(logs, "ℹ️ No hay modal porque el pedido ya habia sido confirmado");
                 }
 
-                console.log("✅ No hay factura, cancelando reclamo");
+                addLog(logs, "✅ No hay factura, cancelando reclamo");
                 stats.successful_reclamos++;
                 await wait(20);
+                guardarResultados({
+                    rowId,
+                    status: "OKAY",
+                    output: logs
+                });
                 continue;
             }
 
@@ -280,34 +327,42 @@ async function main() {
                 const modalResult = await page.evaluate((status) => {
                     const modal = document.querySelector('.modal-dialog');
                     if (!modal) {
-                        console.log("❌ No se encontró el modal");
-                        return { success: false, error: "Modal no encontrado" };
+                        return { success: false, error: "❌ No se encontró el modal" };
                     }
                 
                     const valueMap = {
-                        anulado: 'cancel',        // Reembolso completo
-                        reembolsado: 'refund'     // Reembolso parcial
+                        anulado: 'cancel',
+                        reembolsado: 'refund'
                     };
                 
                     const value = valueMap[status];
                     if (!value) {
-                        console.log(`❌ Estado no válido: ${status}`);
-                        return { success: false, error: "Estado no válido" };
+                        return { success: false, error: `❌ Estado no válido: ${status}` };
                     }
                 
                     const radio = modal.querySelector(`input[type="radio"][data-value="${value}"]`);
                     if (!radio) {
-                        console.log(`❌ No se encontró el radio button para ${value}`);
-                        return { success: false, error: "Radio button no encontrado" };
+                        return { success: false, error: `❌ No se encontró el radio button para ${value}` };
                     }
-                    
+                
                     radio.click();
                     return { success: true };
                 }, reclamo.status);
+                
+                // Ahora logueás desde Node.js
+                if (!modalResult.success) {
+                    addLog(logs, modalResult.error);
+                }
+                
 
                 if (!modalResult.success) {
-                    console.log(`⚠️ Error en el modal: ${modalResult.error}`);
+                    addLog(logs, `⚠️ Error en el modal: ${modalResult.error}`);
                     stats.failed_reclamos++;
+                    guardarResultados({
+                        rowId,
+                        status: "ERROR",
+                        output: logs
+                    });
                     continue;
                 }
                 
@@ -319,7 +374,7 @@ async function main() {
                             ? MOTIVOS_REEMBOLSADO[reclamo.products[0].support_info] || MOTIVOS_REEMBOLSADO['Support - DTC - Contact - Missing Product']
                             : 'Sin motivo';
             
-                console.log(`📝 Intentando escribir motivo: ${inputText}`);
+                addLog(logs, `📝 Intentando escribir motivo: ${inputText}`);
                 // Type into the autocomplete input
                 await page.type('input.ui-autocomplete-input', inputText);
             
@@ -339,18 +394,23 @@ async function main() {
                     }
                     
                     if (!optionFound) {
-                        console.log(`⚠️ No se encontró la opción exacta para: ${inputText}`);
+                        addLog(logs, `⚠️ No se encontró la opción exacta para: ${inputText}`);
                         // Click the first option as fallback
                         if (options.length > 0) {
                             await options[0].click();
-                            console.log("✅ Se seleccionó la primera opción disponible");
+                            addLog(logs, "✅ Se seleccionó la primera opción disponible");
                         } else {
                             throw new Error("No hay opciones disponibles en el dropdown");
                         }
                     }
                 } catch (error) {
-                    console.log(`⚠️ Error al seleccionar opción del dropdown: ${error}`);
+                    addLog(logs, `⚠️ Error al seleccionar opción del dropdown: ${error}`);
                     stats.failed_reclamos++;
+                    guardarResultados({
+                        rowId,
+                        status: "ERROR",
+                        output: logs
+                    });
                     continue;
                 }
             
@@ -360,53 +420,79 @@ async function main() {
                 const reverseResult = await page.evaluate(() => {
                     const modal = document.querySelector('.modal-dialog');
                     if (!modal) {
-                        console.log("❌ Modal desapareció antes de hacer clic en reverse");
-                        return { success: false, error: "Modal no encontrado" };
+                        return { success: false, error: "❌ Modal desapareció antes de hacer clic en reverse" };
                     }
-            
+                
                     const button = modal.querySelector('button[name="reverse_moves"]');
                     if (!button) {
-                        console.log("❌ No se encontró el botón reverse_moves");
-                        return { success: false, error: "Botón no encontrado" };
+                        return { success: false, error: "❌ No se encontró el botón reverse_moves" };
                     }
-                    
+                
                     button.click();
                     return { success: true };
                 });
+                
+                // Afuera, en tu entorno de Node.js
+                if (!reverseResult.success) {
+                    addLog(logs, reverseResult.error);
+                }
+                
 
                 if (!reverseResult.success) {
-                    console.log(`⚠️ Error al hacer clic en reverse: ${reverseResult.error}`);
+                    addLog(logs, `⚠️ Error al hacer clic en reverse: ${reverseResult.error}`);
                     stats.failed_reclamos++;
+                    guardarResultados({
+                        rowId,
+                        status: "ERROR",
+                        output: logs
+                    });
                     continue;
                 }
             
                 await wait(2);
             
                 if (reclamo.status === 'anulado') {
-                    console.log("✅ Anulado con éxito");
+                    addLog(logs, "✅ Anulado con éxito");
                     stats.successful_reclamos++;
+                    guardarResultados({
+                        rowId,
+                        status: "OKAY",
+                        output: logs
+                    });
                 }
             } catch (error) {
-                console.log(`⚠️ Error al interactuar con el modal: ${error}`);
+                addLog(logs, `⚠️ Error al interactuar con el modal: ${error}`);
                 stats.failed_reclamos++;
+                guardarResultados({
+                    rowId,
+                    status: "ERROR",
+                    output: logs
+                });
                 continue;
             }
             
             if (reclamo.status === 'reembolsado' && reclamo.products.length > 0) {
-                await wait(3)
+                await wait(5)
                 await clickButton(page, 'button.o_form_button_edit');
                 await wait(5)
 
                 try {
                     if (!columnsSelected) {
                         await clickButton(page, 'i.o_optional_columns_dropdown_toggle.fa.fa-ellipsis-v');
+                        await page.waitForSelector('input[name="x_studio_id_producto"]', { timeout: 5000 });
                         await clickButton(page, 'input[name="x_studio_id_producto"]');
                         await clickButton(page, 'i.o_optional_columns_dropdown_toggle.fa.fa-ellipsis-v');
+
                         columnsSelected = true;
                     }
                 } catch (error) {
-                    console.log(`⚠️ No se pudo hacer clic en el botón de opciones: ${error}`);
+                    addLog(logs, `⚠️ No se pudo hacer clic en el botón de opciones: ${error}`);
                     stats.failed_reclamos++;
+                    guardarResultados({
+                        rowId,
+                        status: "ERROR",
+                        output: logs
+                    });
                     continue;
                 }
 
@@ -416,24 +502,40 @@ async function main() {
                 for (const p of reclamo.products) {
                     productosReclamo[p.product_id] = p.quantity;
                 }
-                console.log("Productos a reembolsar:", productosReclamo);
+                addLog(logs, "Productos a reembolsar: " + JSON.stringify(productosReclamo));
 
                 // Get initial snapshot of rows
                 const filasSnapshot = await page.evaluate(() => {
                     const rows = Array.from(document.querySelectorAll('tbody.ui-sortable tr.o_data_row'));
-                    return rows.map(row => {
+                    const foundBonificacion = [];
+                
+                    const productIds = rows.map(row => {
                         const cells = row.querySelectorAll('td');
                         const productId = cells[2].textContent.trim();
-                        if (productId === "116") {
-                            console.log("Bonificacion encontrada");
+                
+                        if (productId === "116" || productId === 116) {
+                            foundBonificacion.push(productId);
                         }
+                
                         return productId;
                     });
+                
+                    return { productIds, foundBonificacion };
                 });
-                console.log("Productos encontrados en la tabla:", filasSnapshot);
+                
+                // Ahora, fuera del navegador, podés usar addLog con seguridad
+                if (filasSnapshot.foundBonificacion.length > 0) {
+                    addLog(logs, `Bonificación encontrada para ID(s): ${filasSnapshot.foundBonificacion.join(', ')}`);
+                }
+                
+                addLog(logs, "Productos encontrados en la tabla: " + JSON.stringify(filasSnapshot.productIds));
+
+                const allPresent = Object.keys(productosReclamo).every(key => filasSnapshot?.productIds?.includes(key));
+
+                if(!allPresent) throw new Error("⚠️ Error: Producto no presente en factura");
 
                 // Process each row
-                for (const productId of filasSnapshot) {
+                for (const productId of filasSnapshot.productIds) {
                     try {
                         await wait(2)
                         const rows = await page.$$('tbody.ui-sortable tr.o_data_row');
@@ -446,7 +548,7 @@ async function main() {
                             }, row);
                             if (currentProductId === productId) {
                                 if (productId in productosReclamo) {
-                                    console.log(`Producto ${productId} en reclamo con cantidad ${productosReclamo[productId]}`);
+                                    addLog(logs, `Producto ${productId} en reclamo con cantidad ${productosReclamo[productId]}`);
                                     const cantidadReclamo = productosReclamo[productId];
 
                                     await page.evaluate((row) => {
@@ -456,15 +558,19 @@ async function main() {
 
                                     await wait(2)
                                     await page.type('input[name="quantity"]', cantidadReclamo.toString());
+                                    await wait(1)
+                                    delete productosReclamo[productId];
 
                                     try {
-                                        await clickButton(page, '.o_form_button_save');
-                                        await wait(12)
-                                        await page.waitForSelector('button.o_form_button_edit', { visible: true });
-                                        await clickButton(page, 'button.o_form_button_edit');
+                                        await clickButton(page, 'button[data-value="draft"]');
                                     } catch (error) {
-                                        console.log(`⚠️ No se pudo guardar ${productId}: ${error}`);
+                                        addLog(logs, `⚠️ No se pudo guardar ${productId}: ${error}`);
                                         stats.failed_reclamos++;
+                                        guardarResultados({
+                                            rowId,
+                                            status: "ERROR",
+                                            output: logs
+                                        });
                                         continue;
                                     }
                                 } else {
@@ -476,8 +582,13 @@ async function main() {
                                         }, row);
                                         await wait(2)
                                     } catch (error) {
-                                        console.log(`⚠️ No se pudo borrar ${productId}: ${error}`);
+                                        addLog(logs, `⚠️ No se pudo borrar ${productId}: ${error}`);
                                         stats.failed_reclamos++;
+                                        guardarResultados({
+                                            rowId,
+                                            status: "ERROR",
+                                            output: logs
+                                        });
                                         continue;
                                     }
                                 }
@@ -485,8 +596,13 @@ async function main() {
                             }
                         }
                     } catch (error) {
-                        console.log(`⚠️ Error general con el producto ${productId}: ${error}`);
+                        addLog(logs, `⚠️ Error general con el producto ${productId}: ${error}`);
                         stats.failed_reclamos++;
+                        guardarResultados({
+                            rowId,
+                            status: "ERROR",
+                            output: logs
+                        });
                         continue;
                     }
                 }
@@ -503,7 +619,7 @@ async function main() {
                 const invoiceElement = await page.$('ol.breadcrumb li.breadcrumb-item.o_back_button a');
                 const invoiceId = await page.evaluate(el => el.textContent.trim(), invoiceElement);
 
-                console.log("Esperando a que se actualice la tabla");
+                addLog(logs, "Esperando a que se actualice la tabla");
                 await wait(10)
                 await page.waitForSelector('table tbody tr');
                 const finalRows = await page.$$('table tbody tr');
@@ -513,7 +629,7 @@ async function main() {
                     if (columns.length === 3) {
                         const invoiceNumber = await page.evaluate(el => el.textContent.trim(), columns[1]);
                         if (invoiceNumber === invoiceId) {
-                            console.log(`Found matching invoice: ${invoiceNumber}`);
+                            addLog(logs, `Found matching invoice: ${invoiceNumber}`);
                             try {
                                 // Find the <a> tag in the row whose innerText is "Añadir"
                                 const links = await row.$$('a');
@@ -529,13 +645,23 @@ async function main() {
                                 if (addButton) {
                                     await addButton.click();
                                     stats.successful_reclamos++;
-                                    console.log("✅ Reembolso parcial exitoso");
+                                    addLog(logs, "✅ Reembolso parcial exitoso");
+                                    guardarResultados({
+                                        rowId,
+                                        status: "OKAY",
+                                        output: logs
+                                    });
                                 } else {
                                     throw new Error("Link with text 'Añadir' not found.");
                                 }
                             } catch (error) {
-                                console.error("⚠️ Error: 'Añadir' button not found in row:", error);
+                                addLog(logs, "⚠️ Error: 'Añadir' button not found in row: " + error);
                                 stats.failed_reclamos++;
+                                guardarResultados({
+                                    rowId,
+                                    status: "ERROR",
+                                    output: logs
+                                });
                             }
                             break;
                         }
@@ -545,8 +671,13 @@ async function main() {
             }
 
         } catch (error) {
-            console.log(`⚠️ Error general procesando reclamo: ${error}`);
+            addLog(logs, `⚠️ Error general procesando reclamo: ${error}`);
             stats.failed_reclamos++;
+            guardarResultados({
+                rowId,
+                status: "ERROR",
+                output: logs
+            });
             continue;
         }
 
@@ -561,8 +692,9 @@ async function main() {
     console.log(`❌ Reclamos fallidos: ${stats.failed_reclamos}`);
     console.log(`📄 Reclamos con múltiples facturas: ${stats.multiple_invoices}`);
     console.log("=".repeat(50));
+    await writeToSheet(resultados);
 
-    await new Promise(r => setTimeout(r, 50000));
+    await wait(50)
     await browser.close();
 }
 

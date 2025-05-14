@@ -22,27 +22,145 @@ function parseNotification(rawInput) {
         .trim();                          // Remove leading/trailing whitespace
 }
 
+function parseSlackIframeHtml(htmlString) {
+    // Detect order number
+    const orderMatch = htmlString.match(/El pedido (\d+)/);
+    const orderNumber = orderMatch ? orderMatch[1] : null;
+
+    // Detect status: reembolso o anulación
+    let status, motive;
+    if (htmlString.includes("fue anulado")) {
+        status = "anulado";
+        const motiveMatch = htmlString.match(/con motivo ([\w_]+)/);
+        motive = motiveMatch ? motiveMatch[1] : null;
+    } else if (htmlString.includes("fue reembolsado")) {
+        status = "reembolsado";
+        motive = null;
+    } else {
+        status = "desconocido";
+        motive = null;
+    }
+
+    // Extract Odoo link
+    let odooLink = null;
+    const lines = htmlString.split('\n');
+    for (const line of lines) {
+        if (line.includes("https://nilus-ar.odoo.com")) {
+            odooLink = line.trim();
+            break;
+        }
+    }
+
+    // Extract products
+    const products = [];
+    if (status === "reembolsado") {
+        const productsLines = [];
+        let insideBlock = false;
+
+        for (const line of lines) {
+            if (line.includes("fue reembolsado")) {
+                insideBlock = true;
+                continue;
+            }
+            if (line.includes("Backoffice:")) {
+                insideBlock = false;
+            }
+            if (insideBlock) {
+                productsLines.push(line.trim());
+            }
+        }
+
+        // Clean lines
+        const cleanLines = productsLines.filter(line => line && !line.startsWith("https"));
+
+        let currentProduct = {};
+        for (const line of cleanLines) {
+            if (!line || line.startsWith("https")) continue;
+
+            if (line.match(/^Support - DTC/)) {
+                currentProduct.support_info = line;
+            } else if (line.startsWith("x")) {
+                const quantityMatch = line.match(/x(\d+)/);
+                currentProduct.quantity = quantityMatch ? quantityMatch[1] : "0";
+            } else if (line.startsWith("$")) {
+                const priceMatch = line.match(/\$(\d+\.?\d*)/);
+                currentProduct.price = priceMatch ? priceMatch[1] : "0";
+                products.push(currentProduct);
+                currentProduct = {};
+            } else if (line.match(/^\d{1,4}$/)) {
+                if (line.length > 3) {
+                    currentProduct.product_id = parseInt(line).toLocaleString('en-US').replace(/,/g, '.');
+                } else {
+                    currentProduct.product_id = line;
+                }
+            } else {
+                currentProduct.product_name = line;
+            }
+        }
+
+        if (Object.keys(currentProduct).length > 0) {
+            products.push(currentProduct);
+        }
+    }
+
+    return {
+        order_number: orderNumber,
+        status,
+        motive,
+        products,
+        odoo_link: odooLink
+    };
+}
+
+function formatReclamoForSheet(reclamoData) {
+    const row = [];
+    // Only add values that exist
+    if (reclamoData.status !== undefined) row.push(reclamoData.status);
+    if (reclamoData.output !== undefined) row.push(reclamoData.output);
+    return [row];
+}
 
 // Asynchronous function to write data to a Google Sheet.
-const writeToSheet = async (values) => {
-    const sheets = google.sheets({ version: 'v4', auth });  // Creates a Sheets API client instance.
-    const range = `${config.sheetName}!A1`;  // The range in the sheet where data will be written.
-    const valueInputOption = 'USER_ENTERED';  // How input data should be interpreted.
-
-    const resource = { values };  // The data to be written.
-
+const writeToSheet = async (data) => {
+    const sheets = google.sheets({ version: 'v4', auth });
+  
+    const requests = [];
+  
+    data.forEach((item) => {
+      const { rowId, status, output } = item;
+      if (!rowId) return; // Skip if rowId is missing
+      const concatOutput = output.join('');
+  
+      // Always write both columns, even if empty
+      const values = [status, concatOutput];
+  
+      // Range: Always write to columns B and C
+      const range = `${config.sheetName}!B${rowId}:C${rowId}`;
+  
+      requests.push({
+        range,
+        values: [values],
+      });
+    });
+  
+    if (requests.length === 0) return;
+  
     try {
-        const res = await sheets.spreadsheets.values.update({
-            spreadsheetId: config.spreadsheetId,
-            range,
-            valueInputOption,
-            resource
-        })
-        return res;  // Returns the response from the Sheets API.
+      const res = await sheets.spreadsheets.values.batchUpdate({
+        spreadsheetId: config.spreadsheetId,
+        requestBody: {
+          valueInputOption: 'USER_ENTERED',
+          data: requests
+        }
+      });
+      console.log("Finished writing to sheet");
+      return res;
     } catch (error) {
-        console.error('error', error);  // Logs errors.
+      console.error('Batch update error:', error);
+      throw error;
     }
-}
+  };
+  
 
 // Asynchronous function to read data from a Google Sheet.
 const readSheet = async () => {
@@ -54,15 +172,27 @@ const readSheet = async () => {
             spreadsheetId: config.spreadsheetId,
             range,
         });
-        const resp = response.data.values;
-        console.log("resp", parseNotification(resp[0]));
-        console.log("typeof resp:", typeof resp);
-        return resp;
+
+        const rows = response.data.values || [];
+
+        // Map first to include real row number (header is row 1)
+        const structuredRows = rows.map((row, index) => ({
+            rowId: index + 2, // +2 because row 1 is header and Sheets is 1-indexed
+            reclamo: parseSlackIframeHtml(parseNotification(row[0] || '')),
+            status: row[1] || '',
+            output: row[2] || ''
+        }));
+
+        // Then filter based on the data content
+        return structuredRows.filter(
+            row => row.status === "Compartidas" && (!row.output || row.output.trim() === '')
+        );
     } catch (error) {
         console.error('error', error);
-        return []; // Returns empty array on error
+        return [];
     }
-}
+};
+
 
 module.exports = {
     writeToSheet,
