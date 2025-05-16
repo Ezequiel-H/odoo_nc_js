@@ -3,7 +3,7 @@ const fs = require('fs');
 const csv = require('csv-parse');
 const path = require('path');
 const { readSheet, writeToSheet } = require('./sheets');
-const { loginToOdoo, wait, clickButton, navigateToReclamo } = require('./functions');
+const { loginToOdoo, wait, clickButton, navigateToReclamo, getHigherImporte } = require('./functions');
 
 // Initialize counters and error tracking
 const stats = {
@@ -36,156 +36,6 @@ const MOTIVOS_REEMBOLSADO = {
     'Support - DTC - Operations - Product Replacement': 'Productos faltantes',
     'Support - DTC - Operations - Order nor Delivered': 'Productos faltantes',
 };
-
-function parseSlackIframeHtml(htmlString) {
-    // Detect order number
-    const orderMatch = htmlString.match(/El pedido (\d+)/);
-    const orderNumber = orderMatch ? orderMatch[1] : null;
-
-    // Detect status: reembolso o anulación
-    let status, motive;
-    if (htmlString.includes("fue anulado")) {
-        status = "anulado";
-        const motiveMatch = htmlString.match(/con motivo ([\w_]+)/);
-        motive = motiveMatch ? motiveMatch[1] : null;
-    } else if (htmlString.includes("fue reembolsado")) {
-        status = "reembolsado";
-        motive = null;
-    } else {
-        status = "desconocido";
-        motive = null;
-    }
-
-    // Extract Odoo link
-    let odooLink = null;
-    const lines = htmlString.split('\n');
-    for (const line of lines) {
-        if (line.includes("https://nilus-ar.odoo.com")) {
-            odooLink = line.trim();
-            break;
-        }
-    }
-
-    // Extract products
-    const products = [];
-    if (status === "reembolsado") {
-        const productsLines = [];
-        let insideBlock = false;
-
-        for (const line of lines) {
-            if (line.includes("fue reembolsado")) {
-                insideBlock = true;
-                continue;
-            }
-            if (line.includes("Backoffice:")) {
-                insideBlock = false;
-            }
-            if (insideBlock) {
-                productsLines.push(line.trim());
-            }
-        }
-
-        // Clean lines
-        const cleanLines = productsLines.filter(line => line && !line.startsWith("https"));
-
-        let currentProduct = {};
-        for (const line of cleanLines) {
-            if (!line || line.startsWith("https")) continue;
-
-            if (line.match(/^Support - DTC/)) {
-                currentProduct.support_info = line;
-            } else if (line.startsWith("x")) {
-                const quantityMatch = line.match(/x(\d+(?:\.\d+)?)/);
-                currentProduct.quantity = quantityMatch ? quantityMatch[1].replace('.', ',') : "0";
-            } else if (line.startsWith("$")) {
-                const priceMatch = line.match(/\$(\d+\.?\d*)/);
-                currentProduct.price = priceMatch ? priceMatch[1] : "0";
-                products.push(currentProduct);
-                currentProduct = {};
-            } else if (line.match(/^\d{1,4}$/)) {
-                if (line.length > 3) {
-                    currentProduct.product_id = parseInt(line).toLocaleString('en-US').replace(/,/g, '.');
-                } else {
-                    currentProduct.product_id = line;
-                }
-            } else {
-                currentProduct.product_name = line;
-            }
-        }
-
-        if (Object.keys(currentProduct).length > 0) {
-            products.push(currentProduct);
-        }
-    }
-
-    return {
-        order_number: orderNumber,
-        status,
-        motive,
-        products,
-        odoo_link: odooLink
-    };
-}
-
-async function processCsvFile(csvFilePath) {
-    return new Promise((resolve, reject) => {
-        const results = [];
-        fs.createReadStream(csvFilePath)
-            .pipe(csv.parse())
-            .on('data', (row) => {
-                if (row.length > 0) {
-                    const htmlContent = row[0];
-                    const parsedData = parseSlackIframeHtml(htmlContent);
-                    results.push(parsedData);
-                }
-            })
-            .on('end', () => resolve(results))
-            .on('error', (error) => reject(error));
-    });
-}
-
-function imprimirReclamo(reclamo) {
-    stats.total_reclamos++;
-    const order = reclamo.order_number || 'N/A';
-    const status = reclamo.status.toLowerCase();
-    const link = reclamo.odoo_link || 'Sin link';
-    console.log("-".repeat(66));
-
-    if (status === 'anulado') {
-        const motivo = MOTIVOS_ANULADO[reclamo.motive] || MOTIVOS_ANULADO.customer_canceled;
-        console.log(`🛑 Pedido ${order} fue ANULADO por: ${motivo}`);
-    } else if (status === 'reembolsado') {
-        console.log(`💸 Pedido ${order} fue REEMBOLSADO por los siguientes productos:`);
-        for (const producto of reclamo.products) {
-            const supportInfo = producto.support_info || '';
-            const motivo = MOTIVOS_REEMBOLSADO[supportInfo] || MOTIVOS_REEMBOLSADO['Support - DTC - Contact - Missing Product'];
-            const nombre = producto.product_name || 'Producto sin nombre';
-            const cantidad = producto.quantity || '?';
-            const precio = producto.price || '?';
-            console.log(`   • ${cantidad} x ${nombre} ($${precio}) → Motivo: ${motivo}`);
-        }
-    } else {
-        console.log(`⚠️ Pedido ${order} tiene un estado desconocido: ${status}`);
-    }
-
-    console.log(`🔗 Ver en Odoo: ${link}`);
-}
-
-async function findAndProcessCsvFile() {
-    // Find CSV file
-    const folderPath = path.join(__dirname);
-    const csvFiles = fs.readdirSync(folderPath).filter(file => file.endsWith('.csv'));
-
-    if (csvFiles.length === 0) {
-        console.log("❌ No se encontraron archivos CSV en el directorio");
-        return null;
-    }
-
-    const csvFile = path.join(folderPath, csvFiles[0]);
-    const reclamos = await processCsvFile(csvFile);
-    console.log(`📊 Total de reclamos a procesar: ${reclamos.length}`);
-    return reclamos;
-}
 
 const resultados = [];
 const guardarResultados = ({rowId, status, output}) => {
@@ -231,6 +81,10 @@ async function main() {
     });
 
     stats.total_reclamos = lineas.length
+
+    console.log(lineas.length)
+
+    console.log(new Date().toLocaleString());
 
     // Login to Odoo
     await loginToOdoo(page);
@@ -476,6 +330,34 @@ async function main() {
                 await clickButton(page, 'button.o_form_button_edit');
                 await wait(5)
 
+                // Get ID ODV
+                let idODV = null;
+                try {
+                    const elementoIdODV = await page.$('ol.breadcrumb li.breadcrumb-item:nth-child(2) a');
+                    idODV = await page.evaluate(el => el.textContent.trim(), elementoIdODV);
+                } catch (error) {
+                    addLog(logs, `⚠️ Error al obtener ID ODV: ${error}`);
+                    stats.failed_reclamos++;
+                    guardarResultados({
+                        rowId,
+                        status: "ERROR",
+                        output: logs
+                    });
+                    continue;
+                }
+                if (!idODV) {
+                    addLog(logs, `⚠️ Error al obtener ID ODV: ${error}`);
+                    stats.failed_reclamos++;
+                    guardarResultados({
+                        rowId,
+                        status: "ERROR",
+                        output: logs
+                    });
+                    continue;
+                }
+
+                console.log("idODV", idODV)
+
                 try {
                     if (!columnsSelected) {
                         await clickButton(page, 'i.o_optional_columns_dropdown_toggle.fa.fa-ellipsis-v');
@@ -505,37 +387,38 @@ async function main() {
                 addLog(logs, "Productos a reembolsar: " + JSON.stringify(productosReclamo));
 
                 // Get initial snapshot of rows
-                const filasSnapshot = await page.evaluate(() => {
+                let productsSnapshot = await page.evaluate(() => {
                     const rows = Array.from(document.querySelectorAll('tbody.ui-sortable tr.o_data_row'));
-                    const foundBonificacion = [];
-                
-                    const productIds = rows.map(row => {
+                    return rows.map(row => {
                         const cells = row.querySelectorAll('td');
+
+                        const odv = (cells[1].querySelector('.o_tag_badge_text')?.textContent.trim() || '').split(" - ")[0].trim();;
                         const productId = cells[2].textContent.trim();
-                
-                        if (productId === "116" || productId === 116) {
-                            foundBonificacion.push(productId);
-                        }
-                
-                        return productId;
+                        const importe = cells[12].textContent.trim();
+                        return { odv, productId, importe };
                     });
-                
-                    return { productIds, foundBonificacion };
                 });
                 
-                // Ahora, fuera del navegador, podés usar addLog con seguridad
-                if (filasSnapshot.foundBonificacion.length > 0) {
-                    addLog(logs, `Bonificación encontrada para ID(s): ${filasSnapshot.foundBonificacion.join(', ')}`);
+                // Check for bonificación outside of browser context
+                const foundBonificacion = productsSnapshot.filter(product => 
+                    product.productId === "116" || product.productId === 116
+                );
+                if (foundBonificacion.length > 0) {
+                    addLog(logs, `Bonificación encontrada para ID(s): ${foundBonificacion.map(p => p.productId).join(', ')}`);
                 }
                 
-                addLog(logs, "Productos encontrados en la tabla: " + JSON.stringify(filasSnapshot.productIds));
-
-                const allPresent = Object.keys(productosReclamo).every(key => filasSnapshot?.productIds?.includes(key));
-
+                const allPresent = Object.keys(productosReclamo).every(key => 
+                    productsSnapshot?.some(product => product.productId === key)
+                );
+                
                 if(!allPresent) throw new Error("⚠️ Error: Producto no presente en factura");
+                
+                productsSnapshot = getHigherImporte(productsSnapshot);
+
+                addLog(logs, "Productos encontrados en la tabla: " + JSON.stringify(productsSnapshot));
 
                 // Process each row
-                for (const productId of filasSnapshot.productIds) {
+                for (const product of productsSnapshot) {
                     try {
                         await wait(2)
                         const rows = await page.$$('tbody.ui-sortable tr.o_data_row');
@@ -543,28 +426,22 @@ async function main() {
                         for (const row of rows) {
                             const currentProductId = await page.evaluate(el => {
                                 const cells = el.querySelectorAll('td');
-                                const text = cells[2].textContent.trim();
-                                return text;
+                                const odv = (cells[1].querySelector('.o_tag_badge_text')?.textContent.trim() || '').split(" - ")[0].trim();
+                                const productId = cells[2].textContent.trim();
+                                const importe = cells[12].textContent.trim();
+                                return { odv, productId, importe };
                             }, row);
-                            if (currentProductId === productId) {
-                                if (productId in productosReclamo) {
-                                    addLog(logs, `Producto ${productId} en reclamo con cantidad ${productosReclamo[productId]}`);
-                                    const cantidadReclamo = productosReclamo[productId];
-
-                                    await page.evaluate((row) => {
-                                        const cell = row.querySelector('td[name="quantity"]');
-                                        cell.click();
-                                    }, row);
-
-                                    await wait(2)
-                                    await page.type('input[name="quantity"]', cantidadReclamo.toString());
-                                    await wait(1)
-                                    delete productosReclamo[productId];
-
+                            if (currentProductId.productId === product.productId && currentProductId.importe === product.importe && currentProductId.odv === product.odv) {
+                                if (currentProductId.odv !== idODV) {
                                     try {
-                                        await clickButton(page, 'button[data-value="draft"]');
+                                        await wait(2)
+                                        await page.evaluate((row) => {
+                                            const button = row.querySelector('button.fa.fa-trash-o[name="delete"]');
+                                            if (button) button.click();
+                                        }, row);
+                                        await wait(2)
                                     } catch (error) {
-                                        addLog(logs, `⚠️ No se pudo guardar ${productId}: ${error}`);
+                                        addLog(logs, `⚠️ No se pudo borrar ${currentProductId.productId}: ${error}`);
                                         stats.failed_reclamos++;
                                         guardarResultados({
                                             rowId,
@@ -574,29 +451,57 @@ async function main() {
                                         continue;
                                     }
                                 } else {
-                                    try {
-                                        await wait(2)
+                                    if (currentProductId.productId in productosReclamo && product.isHigher) {
+                                        addLog(logs, `Producto ${currentProductId.productId} en reclamo con cantidad ${productosReclamo[currentProductId.productId]}`);
+                                        const cantidadReclamo = productosReclamo[currentProductId.productId];
+
                                         await page.evaluate((row) => {
-                                            const button = row.querySelector('button.fa.fa-trash-o[name="delete"]');
-                                            if (button) button.click();
+                                            const cell = row.querySelector('td[name="quantity"]');
+                                            cell.click();
                                         }, row);
+
                                         await wait(2)
-                                    } catch (error) {
-                                        addLog(logs, `⚠️ No se pudo borrar ${productId}: ${error}`);
-                                        stats.failed_reclamos++;
-                                        guardarResultados({
-                                            rowId,
-                                            status: "ERROR",
-                                            output: logs
-                                        });
-                                        continue;
+                                        await page.type('input[name="quantity"]', cantidadReclamo.toString());
+                                        await wait(1)
+                                        delete productosReclamo[currentProductId.productId];
+
+                                        try {
+                                            await clickButton(page, 'button[data-value="draft"]');
+                                        } catch (error) {
+                                            addLog(logs, `⚠️ No se pudo guardar ${currentProductId.productId}: ${error}`);
+                                            stats.failed_reclamos++;
+                                            guardarResultados({
+                                                rowId,
+                                                status: "ERROR",
+                                                output: logs
+                                            });
+                                            continue;
+                                        }
+                                    } else {
+                                        try {
+                                            await wait(2)
+                                            await page.evaluate((row) => {
+                                                const button = row.querySelector('button.fa.fa-trash-o[name="delete"]');
+                                                if (button) button.click();
+                                            }, row);
+                                            await wait(2)
+                                        } catch (error) {
+                                            addLog(logs, `⚠️ No se pudo borrar ${currentProductId.productId}: ${error}`);
+                                            stats.failed_reclamos++;
+                                            guardarResultados({
+                                                rowId,
+                                                status: "ERROR",
+                                                output: logs
+                                            });
+                                            continue;
+                                        }
                                     }
                                 }
                                 break;
                             }
                         }
                     } catch (error) {
-                        addLog(logs, `⚠️ Error general con el producto ${productId}: ${error}`);
+                        addLog(logs, `⚠️ Error general con el producto ${currentProductId.productId}: ${error}`);
                         stats.failed_reclamos++;
                         guardarResultados({
                             rowId,
@@ -693,6 +598,8 @@ async function main() {
     console.log(`📄 Reclamos con múltiples facturas: ${stats.multiple_invoices}`);
     console.log("=".repeat(50));
     await writeToSheet(resultados);
+
+    console.log(new Date().toLocaleString());
 
     await wait(50)
     await browser.close();

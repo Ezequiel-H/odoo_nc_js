@@ -30,7 +30,7 @@ function imprimirReclamo(reclamo) {
         const motivo = MOTIVOS_ANULADO[reclamo.motive] || MOTIVOS_ANULADO.customer_canceled;
         console.log(`🛑 Pedido ${order} fue ANULADO por: ${motivo}`);
     } else if (status === 'reembolsado') {
-        console.log(`💸 Pedido ${order} fue REEMBOLSADO por los siguientes productos:`);
+        console.log(`🛑 Pedido ${order} fue REEMBOLSADO por los siguientes productos:`);
         for (const producto of reclamo.products) {
             const supportInfo = producto.support_info || '';
             const motivo = MOTIVOS_REEMBOLSADO[supportInfo] || MOTIVOS_REEMBOLSADO['Support - DTC - Contact - Missing Product'];
@@ -77,10 +77,44 @@ async function navigateToReclamo(page, reclamo) {
     await wait(10);
 }
 
+const getHigherImporte = (items) => {
+    // Paso 1: Convertir importe a número
+    const parseImporte = (str) => {
+    return parseFloat(str.replace(/[^\d,-]/g, '').replace('.', '').replace(',', '.'));
+    };
+
+    // Paso 2: Agrupar por productId
+    const grouped = {};
+    items.forEach((item, index) => {
+    const numImporte = parseImporte(item.importe);
+    if (!grouped[item.productId]) {
+        grouped[item.productId] = [];
+    }
+    grouped[item.productId].push({ ...item, index, numImporte });
+    });
+
+    // Log products with same productId
+    Object.entries(grouped).forEach(([productId, products]) => {
+        if (products.length > 1) {
+            console.log(`⚠️ Found ${products.length} products with same productId ${productId}:`);
+            products.forEach(p => console.log(`   - Product ID: ${p.productId} ($${p.importe})`));
+        }
+    });
+
+    // Paso 3: Buscar el de mayor importe y marcarlo con isHigher
+    Object.values(grouped).forEach(group => {
+    const max = group.reduce((a, b) => (a.numImporte > b.numImporte ? a : b));
+    items[max.index].isHigher = true;
+    });
+
+    return items;
+}
+
 module.exports = {
     loginToOdoo,
     wait,
     clickButton,
     navigateToReclamo,
-    imprimirReclamo
+    imprimirReclamo,
+    getHigherImporte
 }; 
