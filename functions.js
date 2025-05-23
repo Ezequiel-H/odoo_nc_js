@@ -77,20 +77,23 @@ async function navigateToReclamo(page, reclamo) {
     await wait(10);
 }
 
-const getHigherImporte = (items) => {
+const getHigherImporte = (items, idODV) => {
     // Paso 1: Convertir importe a número
     const parseImporte = (str) => {
-    return parseFloat(str.replace(/[^\d,-]/g, '').replace('.', '').replace(',', '.'));
+        return parseFloat(str.replace(/[^\d,-]/g, '').replace('.', '').replace(',', '.'));
     };
 
-    // Paso 2: Agrupar por productId
+    // Paso 2: Agrupar por productId, solo para items del mismo ODV
     const grouped = {};
     items.forEach((item, index) => {
-    const numImporte = parseImporte(item.importe);
-    if (!grouped[item.productId]) {
-        grouped[item.productId] = [];
-    }
-    grouped[item.productId].push({ ...item, index, numImporte });
+        // Solo procesar items del mismo ODV
+        if (item.odv === idODV) {
+            const numImporte = parseImporte(item.importe);
+            if (!grouped[item.productId]) {
+                grouped[item.productId] = [];
+            }
+            grouped[item.productId].push({ ...item, index, numImporte });
+        }
     });
 
     // Log products with same productId
@@ -103,8 +106,8 @@ const getHigherImporte = (items) => {
 
     // Paso 3: Buscar el de mayor importe y marcarlo con isHigher
     Object.values(grouped).forEach(group => {
-    const max = group.reduce((a, b) => (a.numImporte > b.numImporte ? a : b));
-    items[max.index].isHigher = true;
+        const max = group.reduce((a, b) => (a.numImporte > b.numImporte ? a : b));
+        items[max.index].isHigher = true;
     });
 
     return items;

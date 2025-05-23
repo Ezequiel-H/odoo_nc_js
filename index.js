@@ -120,7 +120,7 @@ async function main() {
                 });
                 throw new Error("🚨 Link invalido. No hay contenido en link de Odoo");
             }
-
+            // await wait(10)
             try {
                 addLog(logs, "Esperando a que se muestre el botón de facturas");
                 const buttonInvoices = await page.waitForSelector('[name="action_view_invoice"]', { visible: true });
@@ -358,6 +358,7 @@ async function main() {
 
                 console.log("idODV", idODV)
 
+                //activar ids en la tabla
                 try {
                     if (!columnsSelected) {
                         await clickButton(page, 'i.o_optional_columns_dropdown_toggle.fa.fa-ellipsis-v');
@@ -413,14 +414,59 @@ async function main() {
                 
                 if(!allPresent) throw new Error("⚠️ Error: Producto no presente en factura");
                 
-                productsSnapshot = getHigherImporte(productsSnapshot);
+                productsSnapshot = getHigherImporte(productsSnapshot, idODV);
 
-                addLog(logs, "Productos encontrados en la tabla: " + JSON.stringify(productsSnapshot));
+                // addLog(logs, "Productos encontrados en la tabla: " + JSON.stringify(productsSnapshot));
 
                 // Process each row
+                const processRow = async (row, product, currentProductId) => {
+                    if (currentProductId.odv !== idODV) {
+                        // Delete rows from different ODVs
+                        await wait(2);
+                        await page.evaluate((row) => {
+                            const button = row.querySelector('button.fa.fa-trash-o[name="delete"]');
+                            if (button) button.click();
+                        }, row);
+                        await wait(2);
+                        return;
+                    }
+
+                    // Handle products in current ODV
+                    if (currentProductId.productId in productosReclamo && product.isHigher) {
+                        // Update quantity for products in reclamo
+                        addLog(logs, `Producto ${currentProductId.productId} en reclamo con cantidad ${productosReclamo[currentProductId.productId]}`);
+                        const cantidadReclamo = productosReclamo[currentProductId.productId];
+
+                        await page.evaluate((row) => {
+                            const cell = row.querySelector('td[name="quantity"]');
+                            cell.click();
+                        }, row);
+
+                        await wait(2);
+                        await page.type('input[name="quantity"]', cantidadReclamo.toString());
+                        await wait(1);
+                        delete productosReclamo[currentProductId.productId];
+
+                        try {
+                            await clickButton(page, 'button[data-value="draft"]');
+                        } catch (error) {
+                            throw new Error(`No se pudo guardar ${currentProductId.productId}: ${error}`);
+                        }
+                    } else {
+                        // Delete other products
+                        await wait(2);
+                        await page.evaluate((row) => {
+                            const button = row.querySelector('button.fa.fa-trash-o[name="delete"]');
+                            if (button) button.click();
+                        }, row);
+                        await wait(2);
+                    }
+                };
+
+                // Main processing loop
                 for (const product of productsSnapshot) {
                     try {
-                        await wait(2)
+                        await wait(2);
                         const rows = await page.$$('tbody.ui-sortable tr.o_data_row');
 
                         for (const row of rows) {
@@ -431,77 +477,27 @@ async function main() {
                                 const importe = cells[12].textContent.trim();
                                 return { odv, productId, importe };
                             }, row);
-                            if (currentProductId.productId === product.productId && currentProductId.importe === product.importe && currentProductId.odv === product.odv) {
-                                if (currentProductId.odv !== idODV) {
-                                    try {
-                                        await wait(2)
-                                        await page.evaluate((row) => {
-                                            const button = row.querySelector('button.fa.fa-trash-o[name="delete"]');
-                                            if (button) button.click();
-                                        }, row);
-                                        await wait(2)
-                                    } catch (error) {
-                                        addLog(logs, `⚠️ No se pudo borrar ${currentProductId.productId}: ${error}`);
-                                        stats.failed_reclamos++;
-                                        guardarResultados({
-                                            rowId,
-                                            status: "ERROR",
-                                            output: logs
-                                        });
-                                        continue;
-                                    }
-                                } else {
-                                    if (currentProductId.productId in productosReclamo && product.isHigher) {
-                                        addLog(logs, `Producto ${currentProductId.productId} en reclamo con cantidad ${productosReclamo[currentProductId.productId]}`);
-                                        const cantidadReclamo = productosReclamo[currentProductId.productId];
 
-                                        await page.evaluate((row) => {
-                                            const cell = row.querySelector('td[name="quantity"]');
-                                            cell.click();
-                                        }, row);
-
-                                        await wait(2)
-                                        await page.type('input[name="quantity"]', cantidadReclamo.toString());
-                                        await wait(1)
-                                        delete productosReclamo[currentProductId.productId];
-
-                                        try {
-                                            await clickButton(page, 'button[data-value="draft"]');
-                                        } catch (error) {
-                                            addLog(logs, `⚠️ No se pudo guardar ${currentProductId.productId}: ${error}`);
-                                            stats.failed_reclamos++;
-                                            guardarResultados({
-                                                rowId,
-                                                status: "ERROR",
-                                                output: logs
-                                            });
-                                            continue;
-                                        }
-                                    } else {
-                                        try {
-                                            await wait(2)
-                                            await page.evaluate((row) => {
-                                                const button = row.querySelector('button.fa.fa-trash-o[name="delete"]');
-                                                if (button) button.click();
-                                            }, row);
-                                            await wait(2)
-                                        } catch (error) {
-                                            addLog(logs, `⚠️ No se pudo borrar ${currentProductId.productId}: ${error}`);
-                                            stats.failed_reclamos++;
-                                            guardarResultados({
-                                                rowId,
-                                                status: "ERROR",
-                                                output: logs
-                                            });
-                                            continue;
-                                        }
-                                    }
+                            if (currentProductId.productId === product.productId && 
+                                currentProductId.importe === product.importe && 
+                                currentProductId.odv === product.odv) {
+                                try {
+                                    await processRow(row, product, currentProductId);
+                                    break; // Exit inner loop after processing matching row
+                                } catch (error) {
+                                    addLog(logs, `⚠️ Error procesando fila: ${error.message}`);
+                                    stats.failed_reclamos++;
+                                    guardarResultados({
+                                        rowId,
+                                        status: "ERROR",
+                                        output: logs
+                                    });
+                                    continue;
                                 }
-                                break;
                             }
                         }
                     } catch (error) {
-                        addLog(logs, `⚠️ Error general con el producto ${currentProductId.productId}: ${error}`);
+                        addLog(logs, `⚠️ Error general con el producto ${product.productId}: ${error}`);
                         stats.failed_reclamos++;
                         guardarResultados({
                             rowId,
@@ -524,7 +520,7 @@ async function main() {
                 const invoiceElement = await page.$('ol.breadcrumb li.breadcrumb-item.o_back_button a');
                 const invoiceId = await page.evaluate(el => el.textContent.trim(), invoiceElement);
 
-                addLog(logs, "Esperando a que se actualice la tabla");
+                addLog(logs, `Factura numero: ${invoiceId} Esperando a que se actualice la tabla`);
                 await wait(10)
                 await page.waitForSelector('table tbody tr');
                 const finalRows = await page.$$('table tbody tr');
@@ -533,6 +529,7 @@ async function main() {
                     const columns = await row.$$('td');
                     if (columns.length === 3) {
                         const invoiceNumber = await page.evaluate(el => el.textContent.trim(), columns[1]);
+                        addLog(logs, `Factura numero: ${invoiceNumber}`);
                         if (invoiceNumber === invoiceId) {
                             addLog(logs, `Found matching invoice: ${invoiceNumber}`);
                             try {
@@ -601,8 +598,14 @@ async function main() {
 
     console.log(new Date().toLocaleString());
 
-    await wait(50)
+    await wait(5)
     await browser.close();
 }
 
-main().catch(console.error); 
+// Export the main function
+module.exports = { main };
+
+// Only run main() if this file is being run directly
+if (require.main === module) {
+    main().catch(console.error);
+} 
