@@ -142,32 +142,32 @@ async function main() {
                 }
             } catch (error) {
                 // Wait for the first visible one and click it
-                const cancelButton = await page.waitForSelector('button[name="action_cancel"]', { visible: true });
-                await cancelButton.click();
+                // const cancelButton = await page.waitForSelector('button[name="action_cancel"]', { visible: true });
+                // await cancelButton.click();
 
-                // Try to find the modal, but don't throw if it doesn't appear
-                const modal = await page.waitForSelector('div.modal-content', { visible: true, timeout: 5000 }).catch(() => null);
+                // // Try to find the modal, but don't throw if it doesn't appear
+                // const modal = await page.waitForSelector('div.modal-content', { visible: true, timeout: 5000 }).catch(() => null);
 
-                if (modal) {
-                    addLog(logs, "✅ Modal encontrado, haciendo clic en Confirmar");
-                    try {
-                        // Wait for the Confirmar button inside the modal to be visible
-                        const confirmButton = await page.waitForSelector('div.modal-content button[name="action_cancel"]', { visible: true });
-                        // Click the Confirmar button
-                        await confirmButton.click();
-                    } catch (modalError) {
-                        addLog(logs, "ℹ️ No se pudo interactuar con el modal, continuando...");
-                    }
-                } else {
-                    addLog(logs, "ℹ️ No hay modal porque el pedido ya habia sido confirmado");
-                }
+                // if (modal) {
+                //     addLog(logs, "✅ Modal encontrado, haciendo clic en Confirmar");
+                //     try {
+                //         // Wait for the Confirmar button inside the modal to be visible
+                //         const confirmButton = await page.waitForSelector('div.modal-content button[name="action_cancel"]', { visible: true });
+                //         // Click the Confirmar button
+                //         await confirmButton.click();
+                //     } catch (modalError) {
+                //         addLog(logs, "ℹ️ No se pudo interactuar con el modal, continuando...");
+                //     }
+                // } else {
+                //     addLog(logs, "ℹ️ No hay modal porque el pedido ya habia sido confirmado");
+                // }
 
-                addLog(logs, "✅ No hay factura, cancelando reclamo");
+                addLog(logs, "✅ No hay factura, no hago nada");
                 stats.successful_reclamos++;
                 await wait(20);
                 guardarResultados({
                     rowId,
-                    status: "OKAY",
+                    status: "NO CANCELADO",
                     output: logs
                 });
                 continue;
